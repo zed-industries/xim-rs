@@ -219,7 +219,8 @@ pub fn handle_request<C: ClientCore>(
             status,
             feedbacks,
         } => {
-            let preedit_string = xim_ctext::compound_text_to_utf8(&preedit_string).unwrap();
+            let preedit_string =
+                xim_ctext::compound_text_to_utf8(&preedit_string).expect("Encoding Error");
             handler.handle_preedit_draw(
                 client,
                 input_method_id,
