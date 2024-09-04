@@ -114,6 +114,10 @@ pub fn handle_request<C: ClientCore>(
             input_method_id,
             input_context_id,
         } => handler.handle_create_ic(client, input_method_id, input_context_id),
+        Request::DestroyIcReply {
+            input_method_id,
+            input_context_id,
+        } => handler.handle_destroy_ic(client, input_method_id, input_context_id),
         Request::SetEventMask {
             input_method_id,
             input_context_id,
@@ -129,6 +133,16 @@ pub fn handle_request<C: ClientCore>(
         Request::CloseReply { input_method_id } => handler.handle_close(client, input_method_id),
         Request::DisconnectReply {} => {
             handler.handle_disconnect();
+            Ok(())
+        }
+        Request::ResetIcReply {
+            input_method_id,
+            input_context_id,
+            preedit_string,
+        } => {
+            let preedit_string =
+                xim_ctext::compound_text_to_utf8(&preedit_string).expect("Encoding error");
+            handler.handle_reset_ic(client, input_method_id, input_context_id, &preedit_string);
             Ok(())
         }
         Request::Error { code, detail, .. } => Err(ClientError::XimError(code, detail)),
@@ -324,6 +338,7 @@ pub trait Client {
         input_method_id: u16,
         input_context_id: u16,
     ) -> Result<(), ClientError>;
+    fn reset_ic(&mut self, input_method_id: u16, input_context_id: u16) -> Result<(), ClientError>;
 }
 
 impl<C> Client for C
@@ -451,6 +466,12 @@ where
             input_context_id,
         })
     }
+    fn reset_ic(&mut self, input_method_id: u16, input_context_id: u16) -> Result<(), ClientError> {
+        self.send_req(Request::ResetIc {
+            input_method_id,
+            input_context_id,
+        })
+    }
 }
 
 #[allow(unused_variables)]
@@ -571,6 +592,15 @@ pub trait ClientHandler<C: Client> {
         client: &mut C,
         input_method_id: u16,
         input_context_id: u16,
+    ) -> Result<(), ClientError> {
+        Ok(())
+    }
+    fn handle_reset_ic(
+        &mut self,
+        client: &mut C,
+        input_method_id: u16,
+        input_context_id: u16,
+        preedit_text: &str,
     ) -> Result<(), ClientError> {
         Ok(())
     }
