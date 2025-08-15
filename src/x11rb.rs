@@ -567,6 +567,12 @@ impl<C: HasConnection> X11rbClient<C> {
                     Ok(false)
                 }
             }
+            Event::Error(ref err)
+                if err.error_kind == x11rb::protocol::ErrorKind::Window
+                    && err.bad_value == self.im_window =>
+            {
+                Err(ClientError::NoXimServer)
+            }
             _ => Ok(false),
         }
     }
