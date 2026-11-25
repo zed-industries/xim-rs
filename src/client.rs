@@ -16,6 +16,7 @@ use core::fmt;
 #[non_exhaustive]
 pub enum ClientError {
     ReadProtocol(xim_parser::ReadError),
+    DecodeText(xim_ctext::DecodeError),
     XimError(xim_parser::ErrorCode, String),
     UnsupportedTransport,
     InvalidReply,
@@ -30,10 +31,17 @@ impl From<xim_parser::ReadError> for ClientError {
     }
 }
 
+impl From<xim_ctext::DecodeError> for ClientError {
+    fn from(e: xim_ctext::DecodeError) -> Self {
+        Self::DecodeText(e)
+    }
+}
+
 impl fmt::Display for ClientError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ClientError::ReadProtocol(e) => write!(f, "Can't read xim message: {}", e),
+            ClientError::DecodeText(e) => write!(f, "Can't decode xim text: {}", e),
             ClientError::XimError(code, detail) => {
                 write!(f, "Server send error code: {:?}, detail: {}", code, detail)
             }
@@ -140,8 +148,7 @@ pub fn handle_request<C: ClientCore>(
             input_context_id,
             preedit_string,
         } => {
-            let preedit_string =
-                xim_ctext::compound_text_to_utf8(&preedit_string).expect("Encoding error");
+            let preedit_string = xim_ctext::compound_text_to_utf8(&preedit_string)?;
             handler.handle_reset_ic(client, input_method_id, input_context_id, &preedit_string);
             Ok(())
         }
@@ -183,13 +190,13 @@ pub fn handle_request<C: ClientCore>(
                 commited,
                 syncronous,
             } => {
-                handler.handle_commit(
-                    client,
-                    input_method_id,
-                    input_context_id,
-                    &xim_ctext::compound_text_to_utf8(&commited).expect("Encoding Error"),
-                )?;
+                let result = xim_ctext::compound_text_to_utf8(&commited)
+                    .map_err(ClientError::from)
+                    .and_then(|text| {
+                        handler.handle_commit(client, input_method_id, input_context_id, &text)
+                    });
 
+                // A rejected commit still needs a reply to unblock the server.
                 if syncronous {
                     client.send_req(Request::SyncReply {
                         input_method_id,
@@ -197,7 +204,7 @@ pub fn handle_request<C: ClientCore>(
                     })?;
                 }
 
-                Ok(())
+                result
             }
             CommitData::Both { .. } => {
                 log::warn!("Both commit data is not supported");
@@ -233,8 +240,7 @@ pub fn handle_request<C: ClientCore>(
             status,
             feedbacks,
         } => {
-            let preedit_string =
-                xim_ctext::compound_text_to_utf8(&preedit_string).expect("Encoding Error");
+            let preedit_string = xim_ctext::compound_text_to_utf8(&preedit_string)?;
             handler.handle_preedit_draw(
                 client,
                 input_method_id,
@@ -603,5 +609,156 @@ pub trait ClientHandler<C: Client> {
         preedit_text: &str,
     ) -> Result<(), ClientError> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Default)]
+    struct TestClient {
+        attrs: AHashMap<AttributeName, u16>,
+        sent: Vec<Request>,
+    }
+
+    impl ClientCore for TestClient {
+        type XEvent = xim_parser::XEvent;
+
+        fn set_attrs(&mut self, _: Vec<Attr>, _: Vec<Attr>) {}
+        fn ic_attributes(&self) -> &AHashMap<AttributeName, u16> {
+            &self.attrs
+        }
+        fn im_attributes(&self) -> &AHashMap<AttributeName, u16> {
+            &self.attrs
+        }
+        fn serialize_event(&self, _: &Self::XEvent) -> xim_parser::XEvent {
+            unreachable!()
+        }
+        fn deserialize_event(&self, _: &xim_parser::XEvent) -> Self::XEvent {
+            unreachable!()
+        }
+        fn send_req(&mut self, req: Request) -> Result<(), ClientError> {
+            self.sent.push(req);
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct TestHandler {
+        commits: Vec<String>,
+        reject_commit: bool,
+    }
+
+    impl ClientHandler<TestClient> for TestHandler {
+        fn handle_commit(
+            &mut self,
+            _: &mut TestClient,
+            _: u16,
+            _: u16,
+            text: &str,
+        ) -> Result<(), ClientError> {
+            if self.reject_commit {
+                return Err(ClientError::InvalidReply);
+            }
+            self.commits.push(text.into());
+            Ok(())
+        }
+    }
+
+    fn commit(bytes: &[u8], syncronous: bool) -> Request {
+        Request::Commit {
+            input_method_id: 1,
+            input_context_id: 2,
+            data: CommitData::Chars {
+                commited: bytes.to_vec(),
+                syncronous,
+            },
+        }
+    }
+
+    fn assert_sync_reply(client: &TestClient) {
+        assert!(matches!(
+            client.sent.as_slice(),
+            [Request::SyncReply {
+                input_method_id: 1,
+                input_context_id: 2,
+            }]
+        ));
+    }
+
+    #[test]
+    fn invalid_commit_returns_decode_error() {
+        for synchronous in [false, true] {
+            let mut client = TestClient::default();
+            let mut handler = TestHandler::default();
+            // An incomplete UTF-8 character inside an explicitly UTF-8 segment.
+            let result = handle_request(
+                &mut client,
+                &mut handler,
+                commit(b"\x1b%G\xe9\x1b%@", synchronous),
+            );
+            assert!(matches!(result, Err(ClientError::DecodeText(_))));
+            assert!(handler.commits.is_empty());
+            if synchronous {
+                assert_sync_reply(&client);
+            } else {
+                assert!(client.sent.is_empty());
+            }
+            // The next valid commit is still delivered.
+            handle_request(&mut client, &mut handler, commit(b"ok", false)).unwrap();
+            assert_eq!(handler.commits, ["ok"]);
+        }
+    }
+
+    #[test]
+    fn valid_commit_is_delivered_and_acknowledged() {
+        for bytes in [b"\xe9".as_slice(), b"\x1b%G\xc3\xa9\x1b%@".as_slice()] {
+            let mut client = TestClient::default();
+            let mut handler = TestHandler::default();
+            handle_request(&mut client, &mut handler, commit(bytes, true)).unwrap();
+            assert_eq!(handler.commits, ["é"]);
+            assert_sync_reply(&client);
+        }
+    }
+
+    #[test]
+    fn rejected_commit_is_acknowledged() {
+        let mut client = TestClient::default();
+        let mut handler = TestHandler {
+            reject_commit: true,
+            ..TestHandler::default()
+        };
+        let result = handle_request(&mut client, &mut handler, commit(b"ok", true));
+        assert!(matches!(result, Err(ClientError::InvalidReply)));
+        assert_sync_reply(&client);
+    }
+
+    #[test]
+    fn invalid_preedit_and_reset_return_decode_errors() {
+        for request in [
+            Request::ResetIcReply {
+                input_method_id: 1,
+                input_context_id: 2,
+                preedit_string: b"\x1b%G\xe9\x1b%@".to_vec(),
+            },
+            Request::PreeditDraw {
+                input_method_id: 1,
+                input_context_id: 2,
+                caret: 0,
+                chg_first: 0,
+                chg_length: 0,
+                status: PreeditDrawStatus::empty(),
+                preedit_string: b"\x1b%G\xe9\x1b%@".to_vec(),
+                feedbacks: vec![],
+            },
+        ] {
+            let result = handle_request(
+                &mut TestClient::default(),
+                &mut TestHandler::default(),
+                request,
+            );
+            assert!(matches!(result, Err(ClientError::DecodeText(_))));
+        }
     }
 }
